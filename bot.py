@@ -1,8 +1,10 @@
-"""Telegram Inbox Bot (Persian): anonymous-style inbox via ?start=ref_<id> while showing full sender identity to the owner."""
+"""Telegram Inbox Bot (Persian): tracks /start events, shows sender identity to owner, and persists to Postgres/SQLite."""
 
 from __future__ import annotations
 
 import html
+import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -69,13 +71,13 @@ async def get_owner_display_handle(context: ContextTypes.DEFAULT_TYPE, owner_id:
     return "مالک ربات"
 
 
-def format_sender_header(user: User, chat_id: int) -> str:
+def format_sender_header(user: User, chat_id: int, title: str = "📩 پیام جدید دریافت شد") -> str:
     """Build an HTML-formatted Persian sender identity block for the bot owner."""
     full_name = html.escape(user.full_name or "نامشخص")
     username = f"@{html.escape(user.username)}" if user.username else "<i>ندارد</i>"
     profile_link = f'<a href="tg://user?id={user.id}">{full_name}</a>'
     return (
-        f"📩 <b>پیام جدید دریافت شد</b>\n\n"
+        f"<b>{html.escape(title)}</b>\n\n"
         f"👤 <b>نام:</b> {profile_link}\n"
         f"🔗 <b>یوزرنیم:</b> {username}\n"
         f"🆔 <b>آیدی عددی (User ID):</b> <code>{user.id}</code>\n"
@@ -84,7 +86,7 @@ def format_sender_header(user: User, chat_id: int) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start and ?start=ref_<id> deep links."""
+    """Handle /start and ?start=ref_<id> deep links, logging and notifying owner."""
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
@@ -95,12 +97,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_owner(user):
         bot_username = context.bot.username or "your_bot"
         ref_link = f"https://t.me/{html.escape(bot_username)}?start=ref_{user.id}"
+        db_mode = "PostgreSQL" if db.is_postgres else "SQLite"
         await message.reply_text(
             "👑 <b>حالت مالک فعال است</b>\n\n"
             f"🔗 <b>لینک پیام ناشناس شما:</b>\n{ref_link}\n\n"
-            "هر کسی با این لینک پیام بفرستد، پیامش همراه با نام، یوزرنیم، آیدی عددی و چت آیدی برای شما ارسال می‌شود.\n\n"
+            "هر کسی با این لینک ربات را استارت کند یا پیام بفرستد، فوراً همراه با نام، یوزرنیم، آیدی عددی و چت آیدی به شما اطلاع داده می‌شود و در دیتابیس ذخیره می‌گردد.\n\n"
+            f"💾 <b>دیتابیس فعال:</b> {db_mode}\n\n"
             "<b>دستورات:</b>\n"
-            "• <code>/stats</code> — مشاهده آمار پیام‌ها\n"
+            "• <code>/stats</code> — آمار کل کاربران، استارت‌ها و پیام‌ها\n"
+            "• <code>/users</code> — لیست آخرین کاربرانی که ربات را استارت کرده‌اند\n"
+            "• <code>/export</code> — دریافت فایل بکاپ کامل دیتابیس (JSON)\n"
             "• <code>/block &lt;user_id&gt;</code> — مسدود کردن کاربر\n"
             "• <code>/unblock &lt;user_id&gt;</code> — رفع مسدودیت کاربر\n"
             "• برای پاسخ دادن، روی هر پیام دریافتی ریپلای (Reply) کنید.",
@@ -111,6 +117,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if owner_id is None:
         await message.reply_text("⚠️ ربات هنوز توسط مالک تنظیم نشده است.")
         return
+
+    start_param = context.args[0] if context.args else None
+    sender_name = user.full_name or "نامشخص"
+    start_count = db.record_start(
+        user_id=user.id,
+        chat_id=message.chat_id,
+        username=user.username,
+        full_name=sender_name,
+        start_param=start_param,
+    )
+
+    param_line = (
+        f"\n🔗 <b>پارامتر لینک:</b> <code>{html.escape(start_param)}</code>"
+        if start_param
+        else "\n🔗 <b>پارامتر لینک:</b> <i>بدون پارامتر</i>"
+    )
+    notify_text = (
+        f"{format_sender_header(user, message.chat_id, title='🔔 کاربر جدید ربات را استارت کرد!')}"
+        f"{param_line}\n"
+        f"🔢 <b>تعداد استارت:</b> {start_count}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=notify_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        logger.warning("Failed to notify owner %s about /start from %s: %s", owner_id, user.id, exc)
 
     owner_handle = await get_owner_display_handle(context, owner_id)
     await message.reply_text(
@@ -135,18 +170,66 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show message and block statistics (owner only)."""
+    """Show user, /start, message, and block statistics (owner only)."""
     message = update.effective_message
     if not message or not is_owner(update.effective_user):
         return
 
-    total, unique_senders, blocked = db.get_stats()
+    total_users, total_starts, total_messages, unique_senders, blocked = db.get_stats()
+    db_mode = "PostgreSQL" if db.is_postgres else "SQLite"
     await message.reply_text(
-        f"📊 <b>آمار ربات</b>\n"
-        f"• کل پیام‌ها: <b>{total}</b>\n"
+        f"📊 <b>آمار ربات ({db_mode})</b>\n"
+        f"• کل کاربران ثبت‌شده: <b>{total_users}</b>\n"
+        f"• کل دفعات استارت: <b>{total_starts}</b>\n"
+        f"• کل پیام‌ها: <b>{total_messages}</b>\n"
         f"• فرستنده‌های یکتا: <b>{unique_senders}</b>\n"
         f"• کاربران مسدودشده: <b>{blocked}</b>",
         parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the most recent users who started or messaged the bot (owner only)."""
+    message = update.effective_message
+    if not message or not is_owner(update.effective_user):
+        return
+
+    users = db.get_recent_users(limit=20)
+    if not users:
+        await message.reply_text("هنوز هیچ کاربری ثبت نشده است.")
+        return
+
+    lines = ["👥 <b>آخرین کاربران ثبت‌شده:</b>\n"]
+    for idx, row in enumerate(users, start=1):
+        name = html.escape(str(row["full_name"]))
+        username = f"@{html.escape(row['username'])}" if row.get("username") else "ندارد"
+        uid = row["user_id"]
+        cid = row["chat_id"]
+        starts = row["start_count"]
+        lines.append(
+            f"{idx}. <a href=\"tg://user?id={uid}\">{name}</a> | {username}\n"
+            f"   🆔 <code>{uid}</code> | 💬 <code>{cid}</code> | استارت: {starts}"
+        )
+
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export the full database as a JSON file to the owner (owner only)."""
+    message = update.effective_message
+    if not message or not is_owner(update.effective_user):
+        return
+
+    data = db.export_all()
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    bio = io.BytesIO(payload)
+    bio.name = "thetanonbot_export.json"
+    await message.reply_document(
+        document=bio,
+        caption=(
+            f"💾 بکاپ کامل دیتابیس\n"
+            f"کاربران: {len(data['users'])} | استارت‌ها: {len(data['start_logs'])} | پیام‌ها: {len(data['messages'])}"
+        ),
     )
 
 
@@ -272,7 +355,15 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
                 text=body,
                 parse_mode=ParseMode.HTML,
             )
-            db.record_message(sent.message_id, user.id, user.username, sender_name)
+            db.record_message(
+                sent.message_id,
+                user.id,
+                user.username,
+                sender_name,
+                chat_id=message.chat_id,
+                message_type="text",
+                content_preview=message.text[:500],
+            )
         else:
             header_msg = await context.bot.send_message(
                 chat_id=owner_id,
@@ -280,8 +371,25 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
                 parse_mode=ParseMode.HTML,
             )
             copied = await message.copy(chat_id=owner_id)
-            db.record_message(header_msg.message_id, user.id, user.username, sender_name)
-            db.record_message(copied.message_id, user.id, user.username, sender_name)
+            media_preview = message.caption[:500] if message.caption else None
+            db.record_message(
+                header_msg.message_id,
+                user.id,
+                user.username,
+                sender_name,
+                chat_id=message.chat_id,
+                message_type="media",
+                content_preview=media_preview,
+            )
+            db.record_message(
+                copied.message_id,
+                user.id,
+                user.username,
+                sender_name,
+                chat_id=message.chat_id,
+                message_type="media",
+                content_preview=media_preview,
+            )
 
         await message.reply_text("✅ پیام شما با موفقیت ارسال شد!")
     except TelegramError as exc:
@@ -307,6 +415,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_incoming_message))
