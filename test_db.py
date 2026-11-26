@@ -41,10 +41,11 @@ class TestBotDatabase(unittest.TestCase):
 
     def test_format_sender_header_escapes_html(self) -> None:
         user = User(id=777, first_name="<Evil>", last_name="&Co", is_bot=False, username="evil_user")
-        header = format_sender_header(user)
+        header = format_sender_header(user, chat_id=888)
         self.assertIn("&lt;Evil&gt; &amp;Co", header)
         self.assertIn("@evil_user", header)
         self.assertIn("777", header)
+        self.assertIn("888", header)
 
 
 if __name__ == "__main__":
