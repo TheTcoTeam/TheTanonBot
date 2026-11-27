@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import io
 import json
 import logging
 import os
+import signal
 from pathlib import Path
 
+import tornado.web
 from dotenv import load_dotenv
 from telegram import Message, Update, User
 from telegram.constants import ParseMode
@@ -397,6 +400,84 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         await message.reply_text("❌ ارسال پیام با خطا مواجه شد. لطفاً دوباره تلاش کنید.")
 
 
+class HealthHandler(tornado.web.RequestHandler):
+    """Health-check endpoint so GET / and GET /health return 200 OK."""
+
+    def get(self) -> None:
+        self.set_status(200)
+        self.set_header("Content-Type", "application/json; charset=utf-8")
+        self.write(json.dumps({"status": "ok", "bot": "running"}))
+
+
+class WebhookHandler(tornado.web.RequestHandler):
+    """Receives Telegram webhook POST updates and forwards them to the PTB queue."""
+
+    def initialize(self, ptb_app: Application, secret_token: str | None) -> None:
+        self.ptb_app = ptb_app
+        self.secret_token = secret_token
+
+    async def post(self) -> None:
+        if self.secret_token:
+            incoming_secret = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if incoming_secret != self.secret_token:
+                self.set_status(403)
+                self.write("Forbidden")
+                return
+
+        try:
+            data = json.loads(self.request.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.set_status(400)
+            self.write("Bad Request")
+            return
+
+        update = Update.de_json(data, self.ptb_app.bot)
+        if update is not None:
+            await self.ptb_app.update_queue.put(update)
+        self.set_status(200)
+        self.write("OK")
+
+
+async def run_webhook_server(
+    ptb_app: Application,
+    port: int,
+    webhook_url: str,
+    secret_token: str | None,
+) -> None:
+    """Run Tornado HTTP server with health check + Telegram webhook."""
+    await ptb_app.initialize()
+    await ptb_app.start()
+    await ptb_app.bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret_token,
+        allowed_updates=Update.ALL_TYPES,
+    )
+
+    tornado_app = tornado.web.Application(
+        [
+            (r"/", HealthHandler),
+            (r"/health", HealthHandler),
+            (r"/webhook", WebhookHandler, {"ptb_app": ptb_app, "secret_token": secret_token}),
+        ]
+    )
+    tornado_app.listen(port, address="0.0.0.0")
+    logger.info("Webhook server listening on 0.0.0.0:%s -> %s", port, webhook_url)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    try:
+        await stop_event.wait()
+    finally:
+        await ptb_app.stop()
+        await ptb_app.shutdown()
+
+
 def main() -> None:
     """Start the Telegram bot in webhook mode (Render/Web Service) or polling mode (local)."""
     token = os.getenv("BOT_TOKEN", "").strip()
@@ -427,18 +508,9 @@ def main() -> None:
     )
     if base_webhook_url:
         port = int(os.getenv("PORT", "10000"))
-        url_path = "webhook"
-        webhook_url = f"{base_webhook_url.rstrip('/')}/{url_path}"
+        webhook_url = f"{base_webhook_url.rstrip('/')}/webhook"
         secret_token = os.getenv("WEBHOOK_SECRET", "").strip() or None
-        logger.info("Starting webhook on 0.0.0.0:%s -> %s", port, webhook_url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=url_path,
-            webhook_url=webhook_url,
-            secret_token=secret_token,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        asyncio.run(run_webhook_server(app, port, webhook_url, secret_token))
     else:
         logger.info("Starting polling mode...")
         app.run_polling(allowed_updates=Update.ALL_TYPES)

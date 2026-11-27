@@ -2,7 +2,7 @@ name: Keep Render Alive
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -11,9 +11,5 @@ jobs:
     steps:
       - name: Ping Render service
         run: |
-          status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 "https://thetanonbot.onrender.com/")
-          echo "HTTP status: $status"
-          if [ "$status" -eq 0 ] || [ "$status" -ge 500 ]; then
-            echo "Service unreachable or returned 5xx ($status)"
-            exit 1
-          fi
+          curl -fsS --max-time 60 "https://thetanonbot.onrender.com/"
+          echo ""
