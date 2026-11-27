@@ -401,12 +401,16 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
 
 
 class HealthHandler(tornado.web.RequestHandler):
-    """Health-check endpoint so GET / and GET /health return 200 OK."""
+    """Health-check endpoint so GET/HEAD / and /health return a tiny 200 OK."""
 
     def get(self) -> None:
         self.set_status(200)
-        self.set_header("Content-Type", "application/json; charset=utf-8")
-        self.write(json.dumps({"status": "ok", "bot": "running"}))
+        self.set_header("Content-Type", "text/plain; charset=utf-8")
+        self.write("OK")
+
+    def head(self) -> None:
+        self.set_status(200)
+        self.set_header("Content-Type", "text/plain; charset=utf-8")
 
 
 class WebhookHandler(tornado.web.RequestHandler):
